@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         Astra Attack ESP
 // @namespace    anon
-// @version      1.1
-// @description  Enemy wallhack overlay for astra-attack.pages.dev — boxes, health, distance, names, tracers. PC + mobile.
+// @version      1.2
+// @description  Enemy wallhack overlay for astra-attack.pages.dev — boxes, health, distance, names, tracers + whole-map sound radar (gunfire direction/distance beyond replication range) + last-seen ghosts. PC + mobile.
 // @match        https://astra-attack.pages.dev/*
 // @run-at       document-start
 // @grant        none
@@ -18,7 +18,16 @@
 // Mobile: Tampermonkey (Firefox/Edge on Android) or Userscripts (iOS Safari).
 // Tap the ESP chip top-left to toggle. Drag it if it covers something.
 //
-// Keys (PC): F8 master | F7 teammates | F6 tracers | F9 self
+// Chips: M teammates | T tracers | S self | R sound radar | G last-seen ghosts
+// Keys (PC): F8 master | F7 teammates | F6 tracers | F9 self | F10 radar
+//
+// Radar: the server broadcasts every gunshot/explosion in the match as a
+// "combat-sound" event with distance bucket (nearest 10m, 5-80m) and stereo
+// pan (~sin of the bearing relative to your view, quantized to 0.5 steps).
+// The radar draws those readings as wedges and runs a small particle filter
+// per burst to triangulate the shooter's likely position on the map — intel
+// you cannot get from replicated players (~20m cap). Blips are estimates:
+// a burst of 4-6 shots converges to a few meters; a single shot stays fuzzy.
 (() => {
 'use strict';
 if (globalThis.__AA_ESP__ && globalThis.__AA_ESP__.loaded) return;
@@ -29,9 +38,14 @@ const S = {
   myId: null,
   names: new Map(),
   p: null, v: null,
-  cfg: { on: true, self: false, mates: false, tracers: true },
+  cfg: { on: true, self: false, mates: false, tracers: true, radar: true, ghosts: true },
   overlay: null, octx: null,
   ui: null, chip: null, subs: null, uiPos: null,
+  radar: null, rctx: null,
+  sfx: [], sfxProc: 0,
+  clusters: [],
+  ghosts: [],
+  lastAck: 0, hurtAt: 0,
   toastAt: 0, toastMsg: '', lastHint: 0, enemyCount: 0,
 };
 globalThis.__AA_ESP__ = S;
@@ -55,6 +69,24 @@ JSON.parse = function (text, reviver) {
         S.state = out;
         if (typeof out.me === 'string') S.myId = out.me;
         for (const p of out.players) if (p && typeof p.id === 'string' && p.name) S.names.set(p.id, p.name);
+        if (Array.isArray(out.playerExits)) {
+          const now = performance.now();
+          for (const x of out.playerExits) {
+            if (x && x.position && typeof x.position.x === 'number') {
+              S.ghosts.push({ id: x.id, x: x.position.x, z: x.position.z, feet: typeof x.feet === 'number' ? x.feet : 0, t: now });
+            }
+          }
+          if (S.ghosts.length > 24) S.ghosts.splice(0, S.ghosts.length - 24);
+        }
+      } else if (out.type === 'combat-sound' && typeof out.distance === 'number' && typeof out.pan === 'number') {
+        const now = performance.now();
+        if (!(S.lastAck > 0 && now - S.lastAck < 260 && out.distance <= 10)) {
+          S.sfx.push({ t: now, kind: out.kind === 'explosion' ? 'explosion' : 'shot', weapon: out.weapon || '', distance: out.distance, pan: Math.max(-1, Math.min(1, out.pan)), hurt: !!out.hurt });
+          if (S.sfx.length > 90) { const drop = S.sfx.length - 90; S.sfx.splice(0, drop); S.sfxProc = Math.max(0, S.sfxProc - drop); }
+          if (out.hurt) S.hurtAt = now;
+        }
+      } else if (out.type === 'combat-ack') {
+        S.lastAck = performance.now();
       } else if (out.type === 'welcome' && typeof out.id === 'string') {
         S.myId = out.id;
       }
@@ -142,6 +174,122 @@ function toScreen(x, y, z) {
   return { x: (cx / cw * 0.5 + 0.5) * innerWidth, y: (-cy / cw * 0.5 + 0.5) * innerHeight, w: cw };
 }
 
+/* ---------------- sound radar math ---------------- */
+const wrapA = (a) => { while (a > Math.PI) a -= 2 * Math.PI; while (a < -Math.PI) a += 2 * Math.PI; return a; };
+const bucketOf = (d) => (d < 7.5 ? 5 : Math.min(80, Math.round(d / 10) * 10));
+const panOf = (sinrel) => Math.max(-1, Math.min(1, Math.round(sinrel * 2) / 2));
+function mePos(me) {
+  if (!me || !me.position || typeof me.position.x !== 'number' || typeof me.yaw !== 'number') return null;
+  return { x: me.position.x, z: me.position.z, yaw: me.yaw };
+}
+function readingAt(m, px, pz) {
+  const dx = px - m.x, dz = pz - m.z;
+  const d = Math.hypot(dx, dz);
+  const sin = (dx * Math.cos(m.yaw) - dz * Math.sin(m.yaw)) / Math.max(0.001, d);
+  return { d, b: bucketOf(d), p: panOf(sin) };
+}
+function bandSectors(pan) {
+  const ap = Math.abs(pan), side = pan < 0 ? -1 : 1;
+  let bands;
+  if (ap === 0) bands = [[-17, 17], [163, 197]];
+  else if (ap === 0.5) bands = [[20, 46], [134, 160]];
+  else bands = [[52, 128]];
+  if (ap !== 0 && side < 0) bands = bands.map((b) => [-b[1], -b[0]]);
+  return bands;
+}
+function sampleParticles(m, ev, n) {
+  const bands = bandSectors(ev.pan);
+  const out = [];
+  for (let i = 0; i < n; i++) {
+    const band = bands[(Math.random() * bands.length) | 0];
+    const rel = (band[0] + Math.random() * (band[1] - band[0])) * Math.PI / 180;
+    let d = ev.distance <= 5 ? 0.5 + Math.random() * 7 : ev.distance + (Math.random() * 10 - 5);
+    const bearing = m.yaw + rel;
+    const px = Math.min(30, Math.max(-30, m.x + Math.sin(bearing) * d));
+    const pz = Math.min(55, Math.max(-52, m.z + Math.cos(bearing) * d));
+    out.push({ x: px, z: pz, w: 1 });
+  }
+  return out;
+}
+function clusterCentroid(cl, m) {
+  let sx = 0, sz = 0;
+  for (const p of cl.ps) { sx += p.x; sz += p.z; }
+  const n = Math.max(1, cl.ps.length);
+  return { x: sx / n, z: sz / n };
+}
+function clusterSpread(cl, c) {
+  let s = 0;
+  for (const p of cl.ps) s += (p.x - c.x) * (p.x - c.x) + (p.z - c.z) * (p.z - c.z);
+  return Math.sqrt(s / Math.max(1, cl.ps.length));
+}
+function particleWeight(p, m, ev) {
+  const r = readingAt(m, p.x, p.z);
+  const db = Math.abs(r.b - ev.distance), dp = Math.abs(r.p - ev.pan);
+  if (db > 10 || dp > 0.5) return 0;
+  const w = (r.b === ev.distance ? 1 : 0.35) * (r.p === ev.pan ? 1 : 0.25);
+  return w <= 0.2 ? 0 : w;
+}
+function clusterMatchScore(cl, m, ev) {
+  let best = 0;
+  for (const p of cl.ps) {
+    const w = particleWeight(p, m, ev);
+    if (w > best) best = w;
+  }
+  return best;
+}
+function splitBlobs(cl) {
+  const cells = new Map();
+  for (const p of cl.ps) {
+    const key = Math.round(p.x / 9) + ':' + Math.round(p.z / 9);
+    const cell = cells.get(key) || { n: 0, sx: 0, sz: 0 };
+    cell.n++; cell.sx += p.x; cell.sz += p.z;
+    cells.set(key, cell);
+  }
+  const arr = [...cells.values()].sort((a, b) => b.n - a.n).slice(0, 2).filter((c) => c.n >= cl.ps.length * 0.2);
+  return arr.map((c) => ({ x: c.sx / c.n, z: c.sz / c.n, n: c.n }));
+}
+function updateCluster(cl, m, ev) {
+  let kept = [];
+  for (const p of cl.ps) {
+    const w = particleWeight(p, m, ev);
+    if (!w) continue;
+    kept.push({ x: p.x, z: p.z, w });
+  }
+  if (kept.length < 4) { cl.ps = sampleParticles(m, ev, 60); cl.t = performance.now(); return; }
+  const tot = kept.reduce((a, b) => a + b.w, 0);
+  const ps = [];
+  for (let i = 0; i < 60; i++) {
+    let r = Math.random() * tot, pick = kept[0];
+    for (const p of kept) { r -= p.w; if (r <= 0) { pick = p; break; } }
+    ps.push({ x: Math.min(30, Math.max(-30, pick.x + (Math.random() - 0.5) * 1.2)), z: Math.min(55, Math.max(-52, pick.z + (Math.random() - 0.5) * 1.2)) });
+  }
+  cl.ps = ps;
+  cl.t = performance.now();
+}
+function processSfx(me) {
+  const m = mePos(me);
+  if (!m) return;
+  const now = performance.now();
+  while (S.sfxProc < S.sfx.length) {
+    const ev = S.sfx[S.sfxProc++];
+    if (now - ev.t > 6000) continue;
+    let bestCl = null, bestScore = 0;
+    for (const cl of S.clusters) {
+      if (cl.kind !== ev.kind) continue;
+      const sc = clusterMatchScore(cl, m, ev);
+      if (sc > bestScore) { bestScore = sc; bestCl = cl; }
+    }
+    if (!bestCl) {
+      S.clusters.push({ kind: ev.kind, ps: sampleParticles(m, ev, 60), t: now });
+      if (S.clusters.length > 6) S.clusters.shift();
+    } else {
+      updateCluster(bestCl, m, ev);
+    }
+  }
+  S.clusters = S.clusters.filter((c) => now - c.t < 7000);
+  S.ghosts = S.ghosts.filter((g) => now - g.t < 5000);
+}
+
 /* ---------------- overlay canvas ---------------- */
 function mountOverlay() {
   if (!document.body) return;
@@ -173,16 +321,21 @@ function mountUI() {
   chip.style.cssText = CHIP_CSS;
   const subs = document.createElement('div');
   subs.style.cssText = 'pointer-events:none;margin-left:2px;';
-  for (const [k, label] of [['mates', 'M'], ['tracers', 'T'], ['self', 'S']]) {
-    const s = document.createElement('span');
-    s.dataset.k = k;
-    s.textContent = label;
-    s.style.cssText = CHIP_CSS + 'padding:4px 8px;font-size:11px;';
-    subs.appendChild(s);
+  for (const [k, label] of [['mates', 'M'], ['tracers', 'T'], ['self', 'S'], ['radar', 'R'], ['ghosts', 'G']]) {
+    const sp = document.createElement('span');
+    sp.dataset.k = k;
+    sp.textContent = label;
+    sp.style.cssText = CHIP_CSS + 'padding:4px 8px;font-size:11px;';
+    subs.appendChild(sp);
   }
-  wrap.append(chip, subs);
+  const radar = document.createElement('canvas');
+  radar.id = 'aa-esp-radar';
+  radar.width = 340;
+  radar.height = 340;
+  radar.style.cssText = 'pointer-events:none;display:block;width:170px;height:170px;margin-top:2px;opacity:0.94;';
+  wrap.append(chip, subs, radar);
   document.body.appendChild(wrap);
-  S.ui = wrap; S.chip = chip; S.subs = subs;
+  S.ui = wrap; S.chip = chip; S.subs = subs; S.radar = radar; S.rctx = radar.getContext('2d');
   paintUI();
 
   let dragging = false, moved = false, sx = 0, sy = 0, ox = 0, oy = 0;
@@ -241,6 +394,113 @@ function paintUI() {
 }
 function toast(msg) { S.toastAt = performance.now(); S.toastMsg = msg; }
 
+/* ---------------- radar draw ---------------- */
+function drawRadar(me) {
+  const c = S.radar, ctx = S.rctx;
+  if (!ctx || !c) return;
+  ctx.clearRect(0, 0, c.width, c.height);
+  S.debugBlobs = [];
+  if (!S.cfg.on || !S.cfg.radar) return;
+  const m = mePos(me);
+  if (!m) return;
+  processSfx(me);
+  const now = performance.now();
+  const C = 170, R = 156;
+  const k = R / 85;
+  const LP = (px, pz) => {
+    const dx = px - m.x, dz = pz - m.z;
+    const lx = dx * Math.cos(m.yaw) - dz * Math.sin(m.yaw);
+    const lz = dx * Math.sin(m.yaw) + dz * Math.cos(m.yaw);
+    return { x: C + lx * k, y: C - lz * k };
+  };
+  ctx.save();
+  ctx.beginPath();
+  ctx.arc(C, C, R + 6, 0, Math.PI * 2);
+  ctx.fillStyle = 'rgba(8,10,12,0.42)';
+  ctx.fill();
+  ctx.strokeStyle = 'rgba(255,255,255,0.22)';
+  ctx.lineWidth = 2;
+  ctx.stroke();
+  ctx.beginPath();
+  for (const ring of [20, 40, 60, 80]) {
+    ctx.moveTo(C + ring * k, C);
+    ctx.arc(C, C, ring * k, 0, Math.PI * 2);
+  }
+  ctx.strokeStyle = 'rgba(255,255,255,0.13)';
+  ctx.lineWidth = 1;
+  ctx.stroke();
+  ctx.beginPath();
+  ctx.moveTo(C, C - R);
+  ctx.lineTo(C, C + R);
+  ctx.moveTo(C - R, C);
+  ctx.lineTo(C + R, C);
+  ctx.stroke();
+  ctx.beginPath();
+  ctx.moveTo(C, C - R + 4);
+  ctx.lineTo(C - 6, C - R + 16);
+  ctx.lineTo(C + 6, C - R + 16);
+  ctx.closePath();
+  ctx.fillStyle = 'rgba(255,211,77,0.8)';
+  ctx.fill();
+  ctx.font = '600 15px Consolas,Menlo,monospace';
+  ctx.fillStyle = 'rgba(255,255,255,0.5)';
+  ctx.textAlign = 'center';
+  ctx.fillText('80', C, C + 80 * k + 14);
+  ctx.textAlign = 'left';
+
+  for (const ev of S.sfx) {
+    const age = now - ev.t;
+    if (age > 2200) continue;
+    const a = 1 - age / 2200;
+    const col = ev.kind === 'explosion' ? [255, 160, 60] : [255, 71, 87];
+    const r0 = ev.distance <= 5 ? 0.5 * k : Math.max(0, (ev.distance - 5)) * k;
+    const r1 = (ev.distance + 5) * k;
+    for (const band of bandSectors(ev.pan)) {
+      const a0 = band[0] * Math.PI / 180 - Math.PI / 2;
+      const a1 = band[1] * Math.PI / 180 - Math.PI / 2;
+      ctx.beginPath();
+      ctx.arc(C, C, r1, Math.min(a0, a1), Math.max(a0, a1));
+      ctx.arc(C, C, r0, Math.max(a0, a1), Math.min(a0, a1), true);
+      ctx.closePath();
+      ctx.fillStyle = `rgba(${col[0]},${col[1]},${col[2]},${0.10 + 0.16 * a})`;
+      ctx.fill();
+    }
+  }
+  for (const cl of S.clusters) {
+    const age = now - cl.t;
+    const a = Math.max(0.25, 1 - age / 7000);
+    const cen = clusterCentroid(cl, m);
+    const spread = clusterSpread(cl, cen);
+    const isEx = cl.kind === 'explosion';
+    for (const blob of splitBlobs(cl)) {
+      const d = Math.hypot(blob.x - m.x, blob.z - m.z);
+      const pt = LP(blob.x, blob.z);
+      const rad = Math.max(4, (spread * 1.6 + 2) * k);
+      ctx.beginPath();
+      ctx.arc(pt.x, pt.y, rad, 0, Math.PI * 2);
+      ctx.fillStyle = isEx ? `rgba(255,160,60,${0.22 * a + 0.08})` : `rgba(255,71,87,${0.22 * a + 0.08})`;
+      ctx.fill();
+      ctx.strokeStyle = isEx ? `rgba(255,190,90,${a})` : `rgba(255,110,125,${a})`;
+      ctx.lineWidth = 2;
+      ctx.stroke();
+      ctx.font = '600 13px Consolas,Menlo,monospace';
+      ctx.textAlign = 'center';
+      ctx.fillStyle = `rgba(255,235,235,${a})`;
+      ctx.fillText(Math.round(d) + 'm', pt.x, pt.y - rad - 3);
+      ctx.textAlign = 'left';
+      S.debugBlobs.push({ kind: cl.kind, x: +blob.x.toFixed(2), z: +blob.z.toFixed(2), d: +d.toFixed(1), spread: +spread.toFixed(1), n: blob.n });
+    }
+  }
+  if (S.hurtAt && now - S.hurtAt < 420) {
+    ctx.beginPath();
+    ctx.arc(C, C, R + 3, 0, Math.PI * 2);
+    ctx.strokeStyle = `rgba(255,60,60,${1 - (now - S.hurtAt) / 420})`;
+    ctx.lineWidth = 5;
+    ctx.stroke();
+  }
+  ctx.restore();
+}
+
 /* ---------------- draw ---------------- */
 const hpColor = (h) => (h > 60 ? '#39d98a' : h > 30 ? '#f5c542' : '#ff4757');
 function draw() {
@@ -265,12 +525,22 @@ function draw() {
     ctx.fillText(S.toastMsg, 14, H - 16);
   }
 
-  if (!S.cfg.on || !S.state || !S.p || !S.v) {
+  if (!S.cfg.on || !S.state) {
     S.enemyCount = 0;
+    drawRadar(null);
     return;
   }
   const st = S.state;
-  const me = st.players.find((p) => p.id === S.myId);
+  const me = st.players.find((p) => p.id === S.myId) || null;
+  drawRadar(me);
+  if (!me || !S.p || !S.v) {
+    S.enemyCount = 0;
+    if (!S.p && performance.now() - S.lastHint > 8000) {
+      S.lastHint = performance.now();
+      toast('ESP 준비 중 — 조준(ADS) 한 번 눌러줘');
+    }
+    return;
+  }
   const rows = [];
   for (const p of st.players) {
     if (!p || !p.position || typeof p.feet !== 'number' || typeof p.position.x !== 'number') continue;
@@ -348,9 +618,33 @@ function draw() {
     ctx.fillText(line2, r.x0, r.y0 - 6);
   }
 
-  if (!S.p && performance.now() - S.lastHint > 8000) {
-    S.lastHint = performance.now();
-    toast('ESP 준비 중 — 조준(ADS) 한 번 눌러줘');
+  if (S.cfg.ghosts) {
+    const now = performance.now();
+    for (const g of S.ghosts) {
+      const age = now - g.t;
+      if (age > 5000) continue;
+      const team = (st.roster || st.players).find((x) => x.id === g.id);
+      const isMate = team && me && team.team === me.team;
+      if (isMate && !S.cfg.mates) continue;
+      const sPos = toScreen(g.x, g.feet + 0.9, g.z);
+      if (!sPos) continue;
+      const a = 0.75 * (1 - age / 5000);
+      ctx.globalAlpha = a;
+      ctx.strokeStyle = isMate ? '#2ed3ff' : '#c8a2ff';
+      ctx.lineWidth = 1.5;
+      ctx.beginPath();
+      ctx.moveTo(sPos.x, sPos.y - 10);
+      ctx.lineTo(sPos.x + 10, sPos.y);
+      ctx.lineTo(sPos.x, sPos.y + 10);
+      ctx.lineTo(sPos.x - 10, sPos.y);
+      ctx.closePath();
+      ctx.stroke();
+      ctx.font = '600 11px Consolas,Menlo,monospace';
+      const nm = S.names.get(g.id) || String(g.id).slice(0, 6);
+      ctx.fillStyle = isMate ? '#bfeaff' : '#e6d4ff';
+      ctx.fillText(nm + ' last', sPos.x + 13, sPos.y + 4);
+      ctx.globalAlpha = 1;
+    }
   }
 }
 
@@ -369,6 +663,7 @@ addEventListener('keydown', (e) => {
   else if (e.code === 'F7') set('mates', !S.cfg.mates);
   else if (e.code === 'F6') set('tracers', !S.cfg.tracers);
   else if (e.code === 'F9') set('self', !S.cfg.self);
+  else if (e.code === 'F10') { e.preventDefault(); set('radar', !S.cfg.radar); }
 }, true);
 
 if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', () => { mountUI(); mountOverlay(); });
