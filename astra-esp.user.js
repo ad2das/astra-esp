@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         Astra Attack ESP
 // @namespace    anon
-// @version      1.2
-// @description  Enemy wallhack overlay for astra-attack.pages.dev — boxes, health, distance, names, tracers + whole-map sound radar (gunfire direction/distance beyond replication range) + last-seen ghosts. PC + mobile.
+// @version      1.3
+// @description  Enemy wallhack overlay for astra-attack.pages.dev — render-locked boxes (positions read straight from the game's interpolated player skeletons), health, distance, names, tracers + whole-map sound radar (gunfire direction/distance beyond replication range) + last-seen ghosts. PC + mobile.
 // @match        https://astra-attack.pages.dev/*
 // @run-at       document-start
 // @grant        none
@@ -49,6 +49,25 @@ const S = {
   toastAt: 0, toastMsg: '', lastHint: 0, enemyCount: 0,
 };
 globalThis.__AA_ESP__ = S;
+
+/* ---------------- three.js scene hook ----------------
+   The game bundles its own three.js (rev 180) and tags every replicated
+   player root as "player-<uuid>" in the scene graph. Hooking the three.js
+   devtools registration at document-start hands us every Scene instance;
+   each frame we read the entity root's world position — the exact spot the
+   game is rendering/interpolating the body at, which is smoother and more
+   accurate than the raw state snapshots (and matches the visible character
+   pixel-for-pixel instead of snapping ahead of the interpolation). */
+S.three = { scenes: [], roots: new Map(), lastScan: 0, ok: false };
+try {
+  if (!globalThis.__THREE_DEVTOOLS__) globalThis.__THREE_DEVTOOLS__ = new EventTarget();
+  globalThis.__THREE_DEVTOOLS__.addEventListener('observe', (e) => {
+    const d = e && e.detail;
+    try {
+      if (d && d.isScene && !S.three.scenes.includes(d)) S.three.scenes.push(d);
+    } catch (err) {}
+  });
+} catch (e) {}
 
 try {
   const saved = JSON.parse(localStorage.getItem('aa-esp-cfg-v1') || 'null');
@@ -501,6 +520,45 @@ function drawRadar(me) {
   ctx.restore();
 }
 
+/* ---------------- render-locked positions (scene roots) ---------------- */
+function scanRoots() {
+  const T = S.three;
+  if (!T.scenes.length) return;
+  const found = new Map();
+  for (const sc of T.scenes) {
+    try {
+      sc.traverse((o) => {
+        if (typeof o.name === 'string' && o.name.length > 8 && o.name.startsWith('player-')) {
+          const id = o.name.slice(7);
+          let arr = found.get(id);
+          if (!arr) { arr = []; found.set(id, arr); }
+          arr.push(o);
+        }
+      });
+    } catch (e) {}
+  }
+  T.roots = found;
+  T.ok = found.size > 0;
+  T.lastScan = performance.now();
+}
+function scenePos(p, sp) {
+  const T = S.three;
+  const arr = T.roots.get(p.id);
+  if (!arr || !arr.length) return null;
+  let best = null, bd = 4;
+  for (const o of arr) {
+    let wp;
+    try {
+      if (!o.parent) continue;
+      wp = o.getWorldPosition(o.position.clone());
+    } catch (e) { continue; }
+    if (!isFinite(wp.x) || !isFinite(wp.z)) continue;
+    const d = Math.hypot(wp.x - sp.x, wp.z - sp.z);
+    if (d < bd) { bd = d; best = wp; }
+  }
+  return best;
+}
+
 /* ---------------- draw ---------------- */
 const hpColor = (h) => (h > 60 ? '#39d98a' : h > 30 ? '#f5c542' : '#ff4757');
 function draw() {
@@ -542,6 +600,7 @@ function draw() {
     return;
   }
   const rows = [];
+  if (S.three && S.three.scenes.length && performance.now() - S.three.lastScan > 700) scanRoots();
   for (const p of st.players) {
     if (!p || !p.position || typeof p.feet !== 'number' || typeof p.position.x !== 'number') continue;
     if (p.health <= 0 || p.deployed === false) continue;
@@ -550,7 +609,8 @@ function draw() {
     if (isSelf && !S.cfg.self) continue;
     if (!isSelf && isMate && !S.cfg.mates) continue;
     const h = Math.min(Math.max(p.height || 1.8, 0.5), 2.4);
-    const px = p.position.x, pz = p.position.z, fy = p.feet, hw = 0.38;
+    const rp = S.three && S.three.roots.size ? scenePos(p, p.position) : null;
+    const px = rp ? rp.x : p.position.x, pz = rp ? rp.z : p.position.z, fy = rp ? rp.y : p.feet, hw = 0.38;
     const pts = [];
     for (const dx of [-hw, hw]) for (const dy of [0, h]) for (const dz of [-hw, hw]) {
       const s = toScreen(px + dx, fy + dy, pz + dz);
