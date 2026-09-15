@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         Astra Attack ESP
 // @namespace    anon
-// @version      1.5
-// @description  Enemy wallhack overlay for astra-attack.pages.dev — render-locked boxes, hit-relay pins (shooters who hit you located at any distance), screen-edge gunshot direction arrows (map-wide, <=80m), sound radar, last-seen ghosts. PC + mobile.
+// @version      2.0
+// @description  Enemy wallhack overlay for astra-attack.pages.dev — render-locked boxes, whole-map sound-track boxes (gunshot triangulation, moving estimates), hit-relay pins (shooters who hit you located at any distance), screen-edge gunshot arrows, sound radar, last-seen ghosts, grenade markers. PC + mobile.
 // @match        https://astra-attack.pages.dev/*
 // @run-at       document-start
 // @grant        none
@@ -18,8 +18,8 @@
 // Mobile: Tampermonkey (Firefox/Edge on Android) or Userscripts (iOS Safari).
 // Tap the ESP chip top-left to toggle. Drag it if it covers something.
 //
-// Chips: M teammates | T tracers | S self | R sound radar | G last-seen ghosts
-// Keys (PC): F8 master | F7 teammates | F6 tracers | F9 self | F10 radar
+// Chips: M teammates | T tracers | S self | R sound radar | G last-seen ghosts | K sound tracks
+// Keys (PC): F8 master | F7 teammates | F6 tracers | F9 self | F10 radar | K tracks
 //
 // Radar: the server broadcasts every gunshot/explosion in the match as a
 // "combat-sound" event with distance bucket (nearest 10m, 5-80m) and stereo
@@ -38,12 +38,13 @@ const S = {
   myId: null,
   names: new Map(),
   p: null, v: null,
-  cfg: { on: true, self: false, mates: false, tracers: true, radar: true, ghosts: true },
+  cfg: { on: true, self: false, mates: false, tracers: true, radar: true, ghosts: true, tracks: true },
   overlay: null, octx: null,
   ui: null, chip: null, subs: null, uiPos: null,
   radar: null, rctx: null,
   sfx: [], sfxProc: 0,
   clusters: [],
+  tracks: new Map(), trackSeq: 0, nades: [],
   ghosts: [],
   relays: [],
   lastAck: 0, hurtAt: 0,
@@ -89,6 +90,7 @@ JSON.parse = function (text, reviver) {
         S.state = out;
         if (typeof out.me === 'string') S.myId = out.me;
         for (const p of out.players) if (p && typeof p.id === 'string' && p.name) S.names.set(p.id, p.name);
+        trackFromState(out);
         if (Array.isArray(out.playerExits)) {
           const now = performance.now();
           for (const x of out.playerExits) {
@@ -126,6 +128,13 @@ JSON.parse = function (text, reviver) {
         }
       } else if (out.type === 'combat-ack') {
         S.lastAck = performance.now();
+      } else if (out.type === 'explosion' && Array.isArray(out.position) && typeof out.position[0] === 'number') {
+        /* exact server explosion notice: position is the true detonation point
+           (only sent when the blast is near you, but pixel-accurate). */
+        const nowN = performance.now();
+        S.nades.push({ x: out.position[0], y: out.position[1], z: out.position[2], t: nowN, by: out.playerId || null, hits: Array.isArray(out.hits) ? out.hits.length : 0 });
+        if (S.nades.length > 6) S.nades.shift();
+        exactCluster(out.position[0], out.position[2], nowN);
       } else if (out.type === 'welcome' && typeof out.id === 'string') {
         S.myId = out.id;
       }
@@ -305,6 +314,85 @@ function updateCluster(cl, m, ev) {
   cl.ps = ps;
   cl.t = performance.now();
 }
+/* ---------------- whole-map tracks ----------------
+   The server only replicates enemies inside the ~21m interest radius, so
+   anything farther is rendered as a TRACK: a triangulated sound contact or a
+   last-known real enemy that keeps moving on its measured velocity. Tracks
+   converge to a few meters after a burst of shots and drift while silent. */
+function exactCluster(x, z, t) {
+  const ps = [];
+  for (let i = 0; i < 60; i++) ps.push({ x: x + (Math.random() - 0.5) * 1.6, z: z + (Math.random() - 0.5) * 1.6 });
+  S.clusters.push({ kind: 'explosion', ps, t, exact: true });
+  if (S.clusters.length > 6) S.clusters.shift();
+}
+function trackFromState(st) {
+  const now = performance.now();
+  const seen = new Set();
+  for (const p of st.players) {
+    if (!p || typeof p.id !== 'string' || !p.position || typeof p.position.x !== 'number') continue;
+    seen.add(p.id);
+    let tr = S.tracks.get(p.id);
+    if (!tr) {
+      tr = { key: p.id, id: p.id, syn: false, name: p.name || S.names.get(p.id) || '', team: p.team || null,
+        x: p.position.x, z: p.position.z, feet: typeof p.feet === 'number' ? p.feet : 0,
+        h: Math.min(Math.max(p.height || 1.8, 0.5), 2.4), hp: p.health, weapon: p.weapon || '',
+        vx: 0, vz: 0, err: 0, real: true, tFix: now, tReal: now, tPrev: 0 };
+      S.tracks.set(p.id, tr);
+    } else {
+      const dt = (now - tr.tReal) / 1000;
+      if (dt > 0.01 && dt < 0.6) {
+        const vx = (p.position.x - tr.x) / dt, vz = (p.position.z - tr.z) / dt;
+        if (Math.hypot(vx, vz) < 12) {
+          const a = Math.min(1, dt * 5);
+          tr.vx += (vx - tr.vx) * a;
+          tr.vz += (vz - tr.vz) * a;
+        }
+      }
+      tr.x = p.position.x; tr.z = p.position.z;
+      tr.real = true; tr.tFix = now; tr.tReal = now; tr.err = 0;
+    }
+    tr.name = p.name || tr.name; tr.team = p.team || tr.team; tr.hp = p.health; tr.weapon = p.weapon || '';
+    tr.feet = typeof p.feet === 'number' ? p.feet : tr.feet;
+    tr.h = Math.min(Math.max(p.height || 1.8, 0.5), 2.4);
+    if (!tr.syn) for (const o of S.tracks.values()) {
+      if (o.syn && Math.hypot(o.x - tr.x, o.z - tr.z) < 8) S.tracks.delete(o.key);
+    }
+  }
+  for (const tr of S.tracks.values()) {
+    if (tr.id && !tr.syn && !seen.has(tr.id)) tr.real = false;
+  }
+}
+function trackFromCluster(cl) {
+  const cen = clusterCentroid(cl, null);
+  const spread = clusterSpread(cl, cen);
+  const my = S.state && S.state.players ? S.state.players.find((p) => p.id === S.myId) : null;
+  if (my && my.position && Math.hypot(cen.x - my.position.x, cen.z - my.position.z) < 5.5) return null;
+  const now = performance.now();
+  let best = null, bd = Math.max(12, spread * 2 + 6);
+  for (const tr of S.tracks.values()) {
+    if (tr.real) continue;
+    const d = Math.hypot(tr.x - cen.x, tr.z - cen.z);
+    if (d < bd) { bd = d; best = tr; }
+  }
+  if (!best) {
+    const key = 'syn#' + (++S.trackSeq);
+    best = { key, id: null, syn: true, name: '', team: null, x: cen.x, z: cen.z, feet: 0, h: 1.8,
+      hp: null, weapon: '', vx: 0, vz: 0, err: spread * 1.5 + 3, real: false, tFix: now, tReal: 0, tPrev: 0 };
+    S.tracks.set(key, best);
+  } else {
+    const dt = (now - (best.tPrev || best.tFix)) / 1000;
+    if (dt > 0.35 && dt < 6) {
+      const vx = (cen.x - best.x) / dt, vz = (cen.z - best.z) / dt;
+      if (Math.hypot(vx, vz) < 12) { best.vx = best.vx * 0.5 + vx * 0.5; best.vz = best.vz * 0.5 + vz * 0.5; }
+    }
+    best.x = best.x * 0.35 + cen.x * 0.65;
+    best.z = best.z * 0.35 + cen.z * 0.65;
+    best.err = spread * 1.5 + 2;
+    best.tPrev = best.tFix;
+    best.tFix = now;
+  }
+  return best;
+}
 function processSfx(me) {
   const m = mePos(me);
   if (!m) return;
@@ -326,6 +414,9 @@ function processSfx(me) {
     }
   }
   S.clusters = S.clusters.filter((c) => now - c.t < 7000);
+  if (S.cfg.tracks) for (const cl of S.clusters) trackFromCluster(cl);
+  for (const [k, tr] of S.tracks) { if (!tr.real && now - tr.tFix > 14000) S.tracks.delete(k); }
+  S.nades = S.nades.filter((n) => now - n.t < 9000);
   S.ghosts = S.ghosts.filter((g) => now - g.t < 15000);
   S.relays = S.relays.filter((r) => now - r.t < 15000);
 }
@@ -361,7 +452,7 @@ function mountUI() {
   chip.style.cssText = CHIP_CSS;
   const subs = document.createElement('div');
   subs.style.cssText = 'pointer-events:none;margin-left:2px;';
-  for (const [k, label] of [['mates', 'M'], ['tracers', 'T'], ['self', 'S'], ['radar', 'R'], ['ghosts', 'G']]) {
+  for (const [k, label] of [['mates', 'M'], ['tracers', 'T'], ['self', 'S'], ['radar', 'R'], ['ghosts', 'G'], ['tracks', 'K']]) {
     const sp = document.createElement('span');
     sp.dataset.k = k;
     sp.textContent = label;
@@ -443,7 +534,6 @@ function drawRadar(me) {
   if (!S.cfg.on || !S.cfg.radar) return;
   const m = mePos(me);
   if (!m) return;
-  processSfx(me);
   const now = performance.now();
   const C = 170, R = 156;
   const k = R / 85;
@@ -537,6 +627,13 @@ function drawRadar(me) {
     ctx.strokeStyle = `rgba(255,60,60,${1 - (now - S.hurtAt) / 420})`;
     ctx.lineWidth = 5;
     ctx.stroke();
+  }
+  /* whole-map sound tracks: triangulated contacts + last-known positions */
+  if (S.cfg.tracks) for (const tr of S.tracks.values()) {
+    const pt = LP(tr.x, tr.z);
+    ctx.strokeStyle = 'rgba(255,184,77,0.9)';
+    ctx.lineWidth = 1.5;
+    ctx.strokeRect(pt.x - 4, pt.y - 4, 8, 8);
   }
   /* real-coordinate pins on the radar: hit-relay shooters + last-seen ghosts */
   for (const r of S.relays) {
@@ -634,6 +731,7 @@ function draw() {
   }
   const st = S.state;
   const me = st.players.find((p) => p.id === S.myId) || null;
+  processSfx(me);
   drawRadar(me);
   if (!me || !S.p || !S.v) {
     S.enemyCount = 0;
@@ -720,6 +818,78 @@ function draw() {
     ctx.font = '600 11px Consolas,Menlo,monospace';
     ctx.strokeText(line2, r.x0, r.y0 - 6);
     ctx.fillText(line2, r.x0, r.y0 - 6);
+  }
+
+  /* whole-map sound tracks: estimated moving boxes for contacts outside the
+     replication radius (dashed amber, uncertainty shown). */
+  if (S.cfg.tracks) {
+    const nowT = performance.now();
+    ctx.setLineDash([5, 4]);
+    for (const tr of S.tracks.values()) {
+      if (tr.real) continue;
+      const age = (nowT - tr.tFix) / 1000;
+      if (age > 14) continue;
+      const ext = Math.min(age, 9) * 0.9;
+      const tx = tr.x + tr.vx * ext, tz = tr.z + tr.vz * ext;
+      const a = Math.max(0.15, 1 - age / 14);
+      const fy = tr.feet || 0;
+      const pts = [];
+      for (const dx of [-0.42, 0.42]) for (const dy of [0, tr.h || 1.8]) for (const dz of [-0.42, 0.42]) {
+        const s = toScreen(tx + dx, fy + dy, tz + dz);
+        if (s) pts.push(s);
+      }
+      if (pts.length < 6) continue;
+      let x0 = 1e9, y0 = 1e9, x1 = -1e9, y1 = -1e9;
+      for (const s of pts) { if (s.x < x0) x0 = s.x; if (s.y < y0) y0 = s.y; if (s.x > x1) x1 = s.x; if (s.y > y1) y1 = s.y; }
+      if (x1 < -100 || y1 < -100 || x0 > W + 100 || y0 > H + 100) continue;
+      ctx.globalAlpha = a;
+      ctx.strokeStyle = '#ffb84d';
+      ctx.lineWidth = 1.5;
+      ctx.strokeRect(x0, y0, x1 - x0, y1 - y0);
+      const nm = tr.id ? (S.names.get(tr.id) || String(tr.id).slice(0, 6)) : 'SND';
+      const dist = me && me.position ? Math.hypot(tx - me.position.x, tz - me.position.z) : 0;
+      const line1 = nm;
+      const line2 = '~' + dist.toFixed(0) + 'm ±' + Math.round(tr.err + ext * 3);
+      ctx.font = '600 13px Consolas,Menlo,monospace';
+      ctx.lineWidth = 3;
+      ctx.strokeStyle = 'rgba(0,0,0,0.85)';
+      ctx.fillStyle = '#ffd8a8';
+      ctx.strokeText(line1, x0, y0 - 18);
+      ctx.fillText(line1, x0, y0 - 18);
+      ctx.font = '600 11px Consolas,Menlo,monospace';
+      ctx.strokeText(line2, x0, y0 - 6);
+      ctx.fillText(line2, x0, y0 - 6);
+      ctx.globalAlpha = 1;
+    }
+    ctx.setLineDash([]);
+  }
+
+  /* grenade markers: exact detonation positions from the server's explosion notice */
+  for (const n of S.nades) {
+    const age = (performance.now() - n.t) / 1000;
+    if (age > 8) continue;
+    const sPos = toScreen(n.x, (n.y || 0) + 1.1, n.z);
+    if (!sPos) continue;
+    const a = Math.max(0.2, 1 - age / 8);
+    ctx.globalAlpha = a;
+    ctx.strokeStyle = '#ffa94d';
+    ctx.lineWidth = 2;
+    ctx.beginPath();
+    ctx.moveTo(sPos.x, sPos.y - 9);
+    ctx.lineTo(sPos.x + 9, sPos.y);
+    ctx.lineTo(sPos.x, sPos.y + 9);
+    ctx.lineTo(sPos.x - 9, sPos.y);
+    ctx.closePath();
+    ctx.stroke();
+    const who = n.by ? (S.names.get(n.by) || String(n.by).slice(0, 6)) : '';
+    ctx.font = '600 11px Consolas,Menlo,monospace';
+    ctx.lineWidth = 3;
+    ctx.strokeStyle = 'rgba(0,0,0,0.85)';
+    ctx.fillStyle = '#ffd8a8';
+    const txt = 'NADE' + (who ? ' ' + who : '') + (n.hits ? ' (' + n.hits + ')' : '');
+    ctx.strokeText(txt, sPos.x + 12, sPos.y + 4);
+    ctx.fillText(txt, sPos.x + 12, sPos.y + 4);
+    ctx.globalAlpha = 1;
   }
 
   if (S.cfg.ghosts) {
@@ -843,6 +1013,7 @@ addEventListener('keydown', (e) => {
   else if (e.code === 'F6') set('tracers', !S.cfg.tracers);
   else if (e.code === 'F9') set('self', !S.cfg.self);
   else if (e.code === 'F10') { e.preventDefault(); set('radar', !S.cfg.radar); }
+  else if (e.code === 'KeyK') set('tracks', !S.cfg.tracks);
 }, true);
 
 if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', () => { mountUI(); mountOverlay(); });
