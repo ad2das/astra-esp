@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         Astra Attack ESP
 // @namespace    anon
-// @version      1.3
-// @description  Enemy wallhack overlay for astra-attack.pages.dev — render-locked boxes (positions read straight from the game's interpolated player skeletons), health, distance, names, tracers + whole-map sound radar (gunfire direction/distance beyond replication range) + last-seen ghosts. PC + mobile.
+// @version      1.4
+// @description  Enemy wallhack overlay for astra-attack.pages.dev — render-locked boxes (positions read straight from the game's interpolated player skeletons), health, distance, names, tracers + whole-map sound radar + hit-relay: anyone who shoots YOU is located by their exact server-sent origin (verified 72m away), even far outside the ~21m replication range. PC + mobile.
 // @match        https://astra-attack.pages.dev/*
 // @run-at       document-start
 // @grant        none
@@ -45,6 +45,7 @@ const S = {
   sfx: [], sfxProc: 0,
   clusters: [],
   ghosts: [],
+  relays: [],
   lastAck: 0, hurtAt: 0,
   toastAt: 0, toastMsg: '', lastHint: 0, enemyCount: 0,
 };
@@ -96,6 +97,25 @@ JSON.parse = function (text, reviver) {
             }
           }
           if (S.ghosts.length > 24) S.ghosts.splice(0, S.ghosts.length - 24);
+        }
+      } else if (out.type === 'shot' && Array.isArray(out.origin) && typeof out.origin[0] === 'number') {
+        /* hit-relay: the server relays the shot to the victim at any distance,
+           with the shooter's exact origin. anyone who hits us from outside the
+           replication radius gets pinned on the overlay instead of hinted. */
+        const meNow = S.state && Array.isArray(S.state.players) ? S.state.players.find((p) => p.id === S.myId) : null;
+        if (meNow && meNow.position) {
+          const rd = Math.hypot(out.origin[0] - meNow.position.x, out.origin[2] - meNow.position.z);
+          if (rd > 24) {
+            const nowR = performance.now();
+            const last = S.relays[S.relays.length - 1];
+            const dmg = typeof out.damage === 'number' ? out.damage : 0;
+            if (last && last.id === out.playerId && nowR - last.t < 2600) {
+              last.t = nowR; last.dmg += dmg; last.n++;
+            } else {
+              S.relays.push({ id: out.playerId, x: out.origin[0], y: out.origin[1], z: out.origin[2], t: nowR, d: rd, dmg, n: 1, weapon: out.weapon || '', killed: !!out.killed });
+              if (S.relays.length > 8) S.relays.shift();
+            }
+          }
         }
       } else if (out.type === 'combat-sound' && typeof out.distance === 'number' && typeof out.pan === 'number') {
         const now = performance.now();
@@ -306,7 +326,8 @@ function processSfx(me) {
     }
   }
   S.clusters = S.clusters.filter((c) => now - c.t < 7000);
-  S.ghosts = S.ghosts.filter((g) => now - g.t < 5000);
+  S.ghosts = S.ghosts.filter((g) => now - g.t < 15000);
+  S.relays = S.relays.filter((r) => now - r.t < 15000);
 }
 
 /* ---------------- overlay canvas ---------------- */
@@ -682,13 +703,13 @@ function draw() {
     const now = performance.now();
     for (const g of S.ghosts) {
       const age = now - g.t;
-      if (age > 5000) continue;
+      if (age > 15000) continue;
       const team = (st.roster || st.players).find((x) => x.id === g.id);
       const isMate = team && me && team.team === me.team;
       if (isMate && !S.cfg.mates) continue;
       const sPos = toScreen(g.x, g.feet + 0.9, g.z);
       if (!sPos) continue;
-      const a = 0.75 * (1 - age / 5000);
+      const a = 0.75 * (1 - age / 15000);
       ctx.globalAlpha = a;
       ctx.strokeStyle = isMate ? '#2ed3ff' : '#c8a2ff';
       ctx.lineWidth = 1.5;
@@ -704,6 +725,47 @@ function draw() {
       ctx.fillStyle = isMate ? '#bfeaff' : '#e6d4ff';
       ctx.fillText(nm + ' last', sPos.x + 13, sPos.y + 4);
       ctx.globalAlpha = 1;
+    }
+  }
+
+  /* hit-relay pins: server-sent shooter origins for hits on us from outside replication */
+  if (S.relays.length) {
+    const now = performance.now();
+    for (const r of S.relays) {
+      const age = now - r.t;
+      const a = Math.max(0.35, 1 - age / 15000);
+      const hh = 1.8;
+      const bot = toScreen(r.x, r.y, r.z);
+      const top = toScreen(r.x, r.y + hh, r.z);
+      if (!bot || !top) continue;
+      const bw = Math.max(10, Math.abs(top.y - bot.y) * 0.35);
+      ctx.globalAlpha = a;
+      ctx.strokeStyle = '#ffa94d';
+      ctx.lineWidth = 2;
+      ctx.strokeRect(top.x - bw / 2, top.y, bw, bot.y - top.y);
+      ctx.globalAlpha = a * 0.5;
+      ctx.beginPath();
+      ctx.moveTo(top.x, bot.y);
+      ctx.lineTo(W / 2, H);
+      ctx.stroke();
+      ctx.globalAlpha = 1;
+      const nm = S.names.get(r.id) || String(r.id).slice(0, 6);
+      const line1 = 'HIT ' + nm;
+      const line2 = r.weapon.toUpperCase() + ' · ' + r.d.toFixed(0) + 'm' + (r.dmg ? ' · -' + r.dmg : '') + (r.n > 1 ? ' ×' + r.n : '');
+      ctx.font = '600 13px Consolas,Menlo,monospace';
+      ctx.lineWidth = 3;
+      ctx.strokeStyle = 'rgba(0,0,0,0.85)';
+      ctx.fillStyle = '#ffd8a8';
+      ctx.strokeText(line1, top.x - bw / 2, top.y - 18);
+      ctx.fillText(line1, top.x - bw / 2, top.y - 18);
+      ctx.font = '600 11px Consolas,Menlo,monospace';
+      ctx.strokeText(line2, top.x - bw / 2, top.y - 6);
+      ctx.fillText(line2, top.x - bw / 2, top.y - 6);
+      if (r.killed) {
+        ctx.fillStyle = '#ff6b6b';
+        ctx.font = '700 13px Consolas,Menlo,monospace';
+        ctx.fillText('KILLED YOU', top.x - bw / 2, top.y - 31);
+      }
     }
   }
 }
