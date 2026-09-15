@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         Astra Attack ESP
 // @namespace    anon
-// @version      1.4
-// @description  Enemy wallhack overlay for astra-attack.pages.dev — render-locked boxes (positions read straight from the game's interpolated player skeletons), health, distance, names, tracers + whole-map sound radar + hit-relay: anyone who shoots YOU is located by their exact server-sent origin (verified 72m away), even far outside the ~21m replication range. PC + mobile.
+// @version      1.5
+// @description  Enemy wallhack overlay for astra-attack.pages.dev — render-locked boxes, hit-relay pins (shooters who hit you located at any distance), screen-edge gunshot direction arrows (map-wide, <=80m), sound radar, last-seen ghosts. PC + mobile.
 // @match        https://astra-attack.pages.dev/*
 // @run-at       document-start
 // @grant        none
@@ -538,6 +538,29 @@ function drawRadar(me) {
     ctx.lineWidth = 5;
     ctx.stroke();
   }
+  /* real-coordinate pins on the radar: hit-relay shooters + last-seen ghosts */
+  for (const r of S.relays) {
+    const pt = LP(r.x, r.z);
+    ctx.beginPath();
+    ctx.arc(pt.x, pt.y, 5, 0, Math.PI * 2);
+    ctx.fillStyle = 'rgba(255,169,77,0.9)';
+    ctx.fill();
+    ctx.strokeStyle = '#fff';
+    ctx.lineWidth = 1.5;
+    ctx.stroke();
+  }
+  for (const g of S.ghosts) {
+    const pt = LP(g.x, g.z);
+    ctx.beginPath();
+    ctx.moveTo(pt.x, pt.y - 4.5);
+    ctx.lineTo(pt.x + 4.5, pt.y);
+    ctx.lineTo(pt.x, pt.y + 4.5);
+    ctx.lineTo(pt.x - 4.5, pt.y);
+    ctx.closePath();
+    ctx.strokeStyle = 'rgba(200,162,255,0.85)';
+    ctx.lineWidth = 1.5;
+    ctx.stroke();
+  }
   ctx.restore();
 }
 
@@ -766,6 +789,40 @@ function draw() {
         ctx.font = '700 13px Consolas,Menlo,monospace';
         ctx.fillText('KILLED YOU', top.x - bw / 2, top.y - 31);
       }
+    }
+  }
+
+  /* screen-edge gunshot direction arrows (map-wide audio contacts, <=80m) */
+  if (S.cfg.radar && S.sfx.length) {
+    const nowA = performance.now();
+    const cx = W / 2, cy = H / 2;
+    for (const ev of S.sfx) {
+      const age = nowA - ev.t;
+      if (age > 1500) continue;
+      const a = 1 - age / 1500;
+      const az = ev.pan * Math.PI / 2;
+      let x = cx + Math.sin(az) * W * 0.44;
+      let y = cy - Math.cos(az) * H * 0.42;
+      x = Math.max(18, Math.min(W - 18, x));
+      y = Math.max(18, Math.min(H - 18, y));
+      ctx.save();
+      ctx.translate(x, y);
+      ctx.rotate(az);
+      ctx.globalAlpha = 0.35 + 0.65 * a;
+      ctx.beginPath();
+      ctx.moveTo(0, -11);
+      ctx.lineTo(8, 7);
+      ctx.lineTo(0, 3);
+      ctx.lineTo(-8, 7);
+      ctx.closePath();
+      ctx.fillStyle = ev.hurt ? '#ff3b3b' : ev.kind === 'explosion' ? '#ffa94d' : '#ff6b6b';
+      ctx.fill();
+      ctx.restore();
+      ctx.globalAlpha = 0.45 + 0.55 * a;
+      ctx.font = '600 11px Consolas,Menlo,monospace';
+      ctx.fillStyle = '#ffd8d8';
+      ctx.fillText(Math.round(ev.distance) + 'm', x + 10, y + 4);
+      ctx.globalAlpha = 1;
     }
   }
 }
