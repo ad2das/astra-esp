@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         Astra Attack ESP
 // @namespace    anon
-// @version      2.0
-// @description  Enemy wallhack overlay for astra-attack.pages.dev — render-locked boxes, whole-map sound-track boxes (gunshot triangulation, moving estimates), hit-relay pins (shooters who hit you located at any distance), screen-edge gunshot arrows, sound radar, last-seen ghosts, grenade markers. PC + mobile.
+// @version      2.1
+// @description  Enemy wallhack overlay for astra-attack.pages.dev — render-locked boxes, whole-map sound-track boxes (gunshot triangulation, persistent moving estimates), hit-relay pins (shooters who hit you located at any distance), screen-edge gunshot arrows, sound radar, last-seen ghosts, grenade markers. PC + mobile.
 // @match        https://astra-attack.pages.dev/*
 // @run-at       document-start
 // @grant        none
@@ -336,7 +336,7 @@ function trackFromState(st) {
       tr = { key: p.id, id: p.id, syn: false, name: p.name || S.names.get(p.id) || '', team: p.team || null,
         x: p.position.x, z: p.position.z, feet: typeof p.feet === 'number' ? p.feet : 0,
         h: Math.min(Math.max(p.height || 1.8, 0.5), 2.4), hp: p.health, weapon: p.weapon || '',
-        vx: 0, vz: 0, err: 0, real: true, tFix: now, tReal: now, tPrev: 0 };
+        vx: 0, vz: 0, err: 0, real: true, tFix: now, tReal: now, tPrev: 0, trail: [], tTrail: 0 };
       S.tracks.set(p.id, tr);
     } else {
       const dt = (now - tr.tReal) / 1000;
@@ -350,6 +350,7 @@ function trackFromState(st) {
       }
       tr.x = p.position.x; tr.z = p.position.z;
       tr.real = true; tr.tFix = now; tr.tReal = now; tr.err = 0;
+      if (now - (tr.tTrail || 0) > 900) { tr.trail.push({ x: tr.x, z: tr.z }); if (tr.trail.length > 8) tr.trail.shift(); tr.tTrail = now; }
     }
     tr.name = p.name || tr.name; tr.team = p.team || tr.team; tr.hp = p.health; tr.weapon = p.weapon || '';
     tr.feet = typeof p.feet === 'number' ? p.feet : tr.feet;
@@ -377,7 +378,7 @@ function trackFromCluster(cl) {
   if (!best) {
     const key = 'syn#' + (++S.trackSeq);
     best = { key, id: null, syn: true, name: '', team: null, x: cen.x, z: cen.z, feet: 0, h: 1.8,
-      hp: null, weapon: '', vx: 0, vz: 0, err: spread * 1.5 + 3, real: false, tFix: now, tReal: 0, tPrev: 0 };
+      hp: null, weapon: '', vx: 0, vz: 0, err: spread * 1.5 + 3, real: false, tFix: now, tReal: 0, tPrev: 0, trail: [], tTrail: 0 };
     S.tracks.set(key, best);
   } else {
     const dt = (now - (best.tPrev || best.tFix)) / 1000;
@@ -388,6 +389,7 @@ function trackFromCluster(cl) {
     best.x = best.x * 0.35 + cen.x * 0.65;
     best.z = best.z * 0.35 + cen.z * 0.65;
     best.err = spread * 1.5 + 2;
+    if (now - (best.tTrail || 0) > 900) { best.trail.push({ x: best.x, z: best.z }); if (best.trail.length > 8) best.trail.shift(); best.tTrail = now; }
     best.tPrev = best.tFix;
     best.tFix = now;
   }
@@ -415,10 +417,10 @@ function processSfx(me) {
   }
   S.clusters = S.clusters.filter((c) => now - c.t < 7000);
   if (S.cfg.tracks) for (const cl of S.clusters) trackFromCluster(cl);
-  for (const [k, tr] of S.tracks) { if (!tr.real && now - tr.tFix > 14000) S.tracks.delete(k); }
+  for (const [k, tr] of S.tracks) { if (!tr.real && now - tr.tFix > 60000) S.tracks.delete(k); }
   S.nades = S.nades.filter((n) => now - n.t < 9000);
   S.ghosts = S.ghosts.filter((g) => now - g.t < 15000);
-  S.relays = S.relays.filter((r) => now - r.t < 15000);
+  S.relays = S.relays.filter((r) => now - r.t < 30000);
 }
 
 /* ---------------- overlay canvas ---------------- */
@@ -630,14 +632,29 @@ function drawRadar(me) {
   }
   /* whole-map sound tracks: triangulated contacts + last-known positions */
   if (S.cfg.tracks) for (const tr of S.tracks.values()) {
+    const tAge = (now - tr.tFix) / 1000;
+    const tA = tr.real ? 1 : Math.max(0.2, 1 - tAge / 60);
+    if (!tr.real && tr.trail && tr.trail.length > 1) {
+      ctx.fillStyle = '#ffb84d';
+      for (let i = 0; i < tr.trail.length; i++) {
+        const q = LP(tr.trail[i].x, tr.trail[i].z);
+        ctx.globalAlpha = tA * 0.9 * (i + 1) / tr.trail.length;
+        ctx.beginPath();
+        ctx.arc(q.x, q.y, 1.6, 0, Math.PI * 2);
+        ctx.fill();
+      }
+    }
     const pt = LP(tr.x, tr.z);
+    ctx.globalAlpha = tA;
     ctx.strokeStyle = 'rgba(255,184,77,0.9)';
     ctx.lineWidth = 1.5;
     ctx.strokeRect(pt.x - 4, pt.y - 4, 8, 8);
   }
+  ctx.globalAlpha = 1;
   /* real-coordinate pins on the radar: hit-relay shooters + last-seen ghosts */
   for (const r of S.relays) {
     const pt = LP(r.x, r.z);
+    ctx.globalAlpha = Math.max(0.3, 1 - (now - r.t) / 30000);
     ctx.beginPath();
     ctx.arc(pt.x, pt.y, 5, 0, Math.PI * 2);
     ctx.fillStyle = 'rgba(255,169,77,0.9)';
@@ -646,6 +663,7 @@ function drawRadar(me) {
     ctx.lineWidth = 1.5;
     ctx.stroke();
   }
+  ctx.globalAlpha = 1;
   for (const g of S.ghosts) {
     const pt = LP(g.x, g.z);
     ctx.beginPath();
@@ -828,10 +846,10 @@ function draw() {
     for (const tr of S.tracks.values()) {
       if (tr.real) continue;
       const age = (nowT - tr.tFix) / 1000;
-      if (age > 14) continue;
+      if (age > 60) continue;
       const ext = Math.min(age, 9) * 0.9;
       const tx = tr.x + tr.vx * ext, tz = tr.z + tr.vz * ext;
-      const a = Math.max(0.15, 1 - age / 14);
+      const a = Math.max(0.18, 1 - age / 60);
       const fy = tr.feet || 0;
       const pts = [];
       for (const dx of [-0.42, 0.42]) for (const dy of [0, tr.h || 1.8]) for (const dz of [-0.42, 0.42]) {
@@ -849,7 +867,7 @@ function draw() {
       const nm = tr.id ? (S.names.get(tr.id) || String(tr.id).slice(0, 6)) : 'SND';
       const dist = me && me.position ? Math.hypot(tx - me.position.x, tz - me.position.z) : 0;
       const line1 = nm;
-      const line2 = '~' + dist.toFixed(0) + 'm ±' + Math.round(tr.err + ext * 3);
+      const line2 = '~' + dist.toFixed(0) + 'm ±' + Math.round(tr.err + ext * 3) + (age >= 2 ? ' · ' + Math.round(age) + 's' : '');
       ctx.font = '600 13px Consolas,Menlo,monospace';
       ctx.lineWidth = 3;
       ctx.strokeStyle = 'rgba(0,0,0,0.85)';
@@ -926,7 +944,7 @@ function draw() {
     const now = performance.now();
     for (const r of S.relays) {
       const age = now - r.t;
-      const a = Math.max(0.35, 1 - age / 15000);
+      const a = Math.max(0.25, 1 - age / 30000);
       const hh = 1.8;
       const bot = toScreen(r.x, r.y, r.z);
       const top = toScreen(r.x, r.y + hh, r.z);
